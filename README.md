@@ -50,6 +50,12 @@ Network containment via platform-native firewalls. Blocks all traffic except whi
 | `release` | —            | Restore original firewall state     |
 
 
+Each exception IP must be the address the agent actually dials: the `<address>` in `ossec.conf`. On a VM talking to a cloud manager, that is the public IP, not the server's private or VPC address. If the agent can use IPv6, pass the AAAA address as well.
+
+On Windows, isolate also allows outbound DNS (`remoteip=dns`) and DHCP (`remoteip=dhcp`) so a hostname can resolve and the VM keeps its address. Those rules do not open the rest of the network. `blockinbound,blockoutbound` still drops every other flow.
+
+If the host is already isolated (`backup/fw_rules.xml` exists), `isolate` does nothing until `release` runs.
+
 State stored in `<WarDir>/backup/`.
 
 ### Shell
@@ -388,6 +394,8 @@ Debug log and state file locations:
 ### Isolation
 
 Contain a compromised host by blocking all network traffic except to whitelisted IPs (e.g. Wazuh manager). Restore with `release`.
+
+Pass the manager address from the agent's `ossec.conf` `<address>` (cloud public IP when the agent is a local VM). Windows also allows DNS and DHCP so that address can still be reached. Re-run `release` before `isolate` if the host is already isolated.
 
 **Isolate:**
 

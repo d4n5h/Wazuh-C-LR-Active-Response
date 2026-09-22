@@ -25,6 +25,12 @@ func runCmd(args ...string) (string, string) {
 	return string(out), stderr
 }
 
+func addAllow(name, dir, protocol, remoteip string) (string, string) {
+	return runCmd("netsh", "advfirewall", "firewall", "add", "rule",
+		"name="+name, "dir="+dir, "action=allow", "protocol="+protocol,
+		"remoteip="+remoteip, "profile=any", "enable=yes")
+}
+
 func isolate(ipException []string) (string, string) {
 	if err := validateIPs(ipException); err != nil {
 		return "", err.Error()
@@ -59,16 +65,26 @@ func isolate(ipException []string) (string, string) {
 	errs = append(errs, stderr)
 
 	for _, ip := range ipException {
-		stdout, stderr = runCmd("netsh", "advfirewall", "firewall", "add", "rule",
-			"name=allow-siem-in", "dir=in", "action=allow", "protocol=any", "remoteip="+ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-
-		stdout, stderr = runCmd("netsh", "advfirewall", "firewall", "add", "rule",
-			"name=allow-siem-out", "dir=out", "action=allow", "protocol=any", "remoteip="+ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		for _, dir := range []string{"in", "out"} {
+			name := "allow-siem-out"
+			if dir == "in" {
+				name = "allow-siem-in"
+			}
+			for _, proto := range []string{"tcp", "udp"} {
+				stdout, stderr = addAllow(name, dir, proto, ip)
+				outs = append(outs, stdout)
+				errs = append(errs, stderr)
+			}
+		}
 	}
+
+	stdout, stderr = addAllow("allow-dns-out", "out", "any", "dns")
+	outs = append(outs, stdout)
+	errs = append(errs, stderr)
+
+	stdout, stderr = addAllow("allow-dhcp-out", "out", "udp", "dhcp")
+	outs = append(outs, stdout)
+	errs = append(errs, stderr)
 
 	return strings.Join(outs, " "), strings.Join(errs, " ")
 }
