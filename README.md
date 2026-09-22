@@ -46,11 +46,11 @@ Network containment via platform-native firewalls. Blocks all traffic except whi
 
 | Action    | `extra_args` | Description                         |
 | --------- | ------------ | ----------------------------------- |
-| `isolate` | IP/CIDR list | Block all traffic except listed IPs |
+| `isolate` | IP, CIDR, or FQDN | Block all traffic except listed addresses |
 | `release` | —            | Restore original firewall state     |
 
 
-Each exception IP must be the address the agent actually dials: the `<address>` in `ossec.conf`. On a VM talking to a cloud manager, that is the public IP, not the server's private or VPC address. If the agent can use IPv6, pass the AAAA address as well.
+Each exception is an IP, a CIDR range, or an FQDN such as `manager.example.com`. The name is resolved when isolation starts. A one-minute task then re-resolves it and updates the allow rules on Windows, Linux, and macOS, so a changing manager address keeps working. DNS stays allowed while that task is installed. On Windows 11 and Windows Server 2022 or newer, a firewall dynamic keyword follows the name as well.
 
 On Windows, isolate also allows outbound DNS (`remoteip=dns`) and DHCP (`remoteip=dhcp`) so a hostname can resolve and the VM keeps its address. Those rules do not open the rest of the network. `blockinbound,blockoutbound` still drops every other flow.
 
@@ -395,7 +395,7 @@ Debug log and state file locations:
 
 Contain a compromised host by blocking all network traffic except to whitelisted IPs (e.g. Wazuh manager). Restore with `release`.
 
-Pass the manager address from the agent's `ossec.conf` `<address>` (cloud public IP when the agent is a local VM). Windows also allows DNS and DHCP so that address can still be reached. Re-run `release` before `isolate` if the host is already isolated.
+Pass an IP, a CIDR range, or the manager FQDN from the agent's `ossec.conf` `<address>`. A one-minute task follows that name on Windows, Linux, and macOS. Windows also allows DHCP. Re-run `release` before `isolate` if the host is already isolated. `release` removes the task.
 
 **Isolate:**
 

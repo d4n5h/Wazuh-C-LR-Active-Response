@@ -44,14 +44,124 @@ func isValidIP(ip string) bool {
 	return err == nil
 }
 
-func validateIPs(ips []string) error {
-	for _, ip := range ips {
-		if !isValidIP(ip) {
-			return fmt.Errorf("one or more IP addresses are invalid")
+func isIPv6(ip string) bool {
+	parsed := net.ParseIP(ip)
+	return parsed != nil && parsed.To4() == nil
+}
+
+func isFQDN(name string) bool {
+	if len(name) == 0 || len(name) > 253 || strings.Contains(name, ".") == false {
+		return false
+	}
+	for _, label := range strings.Split(name, ".") {
+		if len(label) == 0 || len(label) > 63 || label[0] == '-' || label[len(label)-1] == '-' {
+			return false
+		}
+		for _, c := range label {
+			if (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') && (c < '0' || c > '9') && c != '-' {
+				return false
+			}
 		}
 	}
-	return nil
+	return true
 }
+
+func expandExceptions(items []string) (staticIPs []string, names []string, resolved []string, err error) {
+	seenStatic := map[string]struct{}{}
+	seenResolved := map[string]struct{}{}
+	for _, item := range items {
+		item = strings.TrimSpace(item)
+		if item == "" {
+			continue
+		}
+		if isValidIP(item) {
+			if _, ok := seenStatic[item]; !ok {
+				seenStatic[item] = struct{}{}
+				staticIPs = append(staticIPs, item)
+			}
+			continue
+		}
+		if !isFQDN(item) {
+			return nil, nil, nil, fmt.Errorf("invalid exception %q: expected an IP, CIDR, or FQDN", item)
+		}
+		names = append(names, item)
+		looked, lerr := net.LookupIP(item)
+		if lerr != nil || len(looked) == 0 {
+			return nil, nil, nil, fmt.Errorf("could not resolve %s", item)
+		}
+		for _, ip := range looked {
+			s := ip.String()
+			if v4 := ip.To4(); v4 != nil {
+				s = v4.String()
+			}
+			if _, ok := seenResolved[s]; ok {
+				continue
+			}
+			seenResolved[s] = struct{}{}
+			resolved = append(resolved, s)
+		}
+	}
+	return staticIPs, names, resolved, nil
+}
+
+func resolveNames(names []string) ([]string, error) {
+	_, _, resolved, err := expandExceptions(names)
+	return resolved, err
+}
+
+func readLines(path string) []string {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var lines []string
+	for _, line := range strings.Split(string(data), "\n") {
+		line = strings.TrimSpace(line)
+		if line != "" {
+			lines = append(lines, line)
+		}
+	}
+	return lines
+}
+
+func writeLines(path string, lines []string) error {
+	body := strings.Join(lines, "\n")
+	if len(lines) > 0 {
+		body += "\n"
+	}
+	return os.WriteFile(path, []byte(body), 0644)
+}
+
+func sameSet(a, b []string) bool {
+	if len(a) != len(b) {
+		return false
+	}
+	count := map[string]int{}
+	for _, s := range a {
+		count[s]++
+	}
+	for _, s := range b {
+		if count[s] == 0 {
+			return false
+		}
+		count[s]--
+	}
+	return true
+}
+
+func selfExe() string {
+	exe, err := os.Executable()
+	if err != nil {
+		return ""
+	}
+	return exe
+}
+
+var (
+	fqdnNamesFile = filepath.Join(backupDir, "fqdn.txt")
+	fqdnIPsFile   = filepath.Join(backupDir, "fqdn-ips.txt")
+	staticIPsFile = filepath.Join(backupDir, "static-ips.txt")
+)
 
 func main() {
 	defer func() {
@@ -59,6 +169,11 @@ func main() {
 			shared.Debug(debugFile, fmt.Sprintf("PANIC: %v", r))
 		}
 	}()
+
+	if len(os.Args) > 1 && os.Args[1] == "refresh" {
+		refresh()
+		return
+	}
 
 	input, raw, err := shared.ReadInput()
 	dt := shared.CurrentDatetime()
