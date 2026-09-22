@@ -16,6 +16,17 @@ var (
 	isolatedMarker = filepath.Join(backupDir, ".isolated")
 )
 
+func joinParts(parts []string) string {
+	var kept []string
+	for _, p := range parts {
+		p = strings.TrimSpace(p)
+		if p != "" {
+			kept = append(kept, p)
+		}
+	}
+	return strings.Join(kept, " ")
+}
+
 func runCmd(name string, args ...string) (string, string) {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
@@ -64,8 +75,8 @@ func isolate(ipException []string) (string, string) {
 	}
 
 	for _, e := range errs {
-		if e != "" {
-			return strings.Join(outs, " "), strings.Join(errs, " ")
+		if strings.TrimSpace(e) != "" {
+			return joinParts(outs), joinParts(errs)
 		}
 	}
 	os.WriteFile(backendFile, []byte(backend), 0644)
@@ -80,7 +91,7 @@ func isolate(ipException []string) (string, string) {
 		errs = append(errs, stderr)
 	}
 
-	return strings.Join(outs, " "), strings.Join(errs, " ")
+	return joinParts(outs), joinParts(errs)
 }
 
 func addNftIP(chain, fam, field, ip string) (string, string) {
@@ -153,7 +164,7 @@ func isolateNftables(staticIPs, resolved []string, allowDNS bool) (string, strin
 		errs = append(errs, stderr)
 	}
 
-	return strings.Join(outs, " "), strings.Join(errs, " ")
+	return joinParts(outs), joinParts(errs)
 }
 
 func addIptablesIP(bin, chain, flag, ip string) (string, string) {
@@ -246,7 +257,7 @@ func isolateIptables(staticIPs, resolved []string, allowDNS bool) (string, strin
 		errs = append(errs, stderr)
 	}
 
-	return strings.Join(outs, " "), strings.Join(errs, " ")
+	return joinParts(outs), joinParts(errs)
 }
 
 func installRefreshTask() (string, string) {
@@ -334,5 +345,5 @@ func release() (string, string) {
 	os.Remove(staticIPsFile)
 	removeRefreshTask()
 
-	return strings.Join(outs, " "), strings.Join(errs, " ")
+	return joinParts(outs), joinParts(errs)
 }
