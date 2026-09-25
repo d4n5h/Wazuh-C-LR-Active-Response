@@ -11,8 +11,8 @@ import (
 )
 
 var (
-	fwBackupFile  = filepath.Join(backupDir, "fw_rules.backup")
-	backendFile   = filepath.Join(backupDir, "backend.type")
+	fwBackupFile   = filepath.Join(backupDir, "fw_rules.backup")
+	backendFile    = filepath.Join(backupDir, "backend.type")
 	isolatedMarker = filepath.Join(backupDir, ".isolated")
 )
 

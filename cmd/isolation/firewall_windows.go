@@ -3,7 +3,6 @@
 package main
 
 import (
-	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -29,30 +28,34 @@ func runCmd(args ...string) (string, string) {
 	return string(out), stderr
 }
 
-func addAllow(name, dir, protocol, remoteip string) (string, string) {
-	return runCmd("netsh", "advfirewall", "firewall", "add", "rule",
-		"name="+name, "dir="+dir, "action=allow", "protocol="+protocol,
-		"remoteip="+remoteip, "profile=any", "enable=yes")
+func addAllow(name, dir, protocol, remoteip, remoteport string) (string, string) {
+	args := []string{"netsh", "advfirewall", "firewall", "add", "rule",
+		"name=" + name, "dir=" + dir, "action=allow", "protocol=" + protocol,
+		"remoteip=" + remoteip, "profile=any", "enable=yes"}
+	if remoteport != "" {
+		args = append(args, "remoteport="+remoteport)
+	}
+	return runCmd(args...)
 }
 
-func addFQDNAllow(name string) (string, string) {
-	script := fmt.Sprintf(`$id = '{' + [guid]::NewGuid().ToString() + '}'
-New-NetFirewallDynamicKeywordAddress -Id $id -Keyword '%s' -AutoResolve $true
-New-NetFirewallRule -DisplayName 'allow-siem-fqdn-out' -Direction Outbound -Action Allow -Profile Any -Enabled True -RemoteDynamicKeywordAddresses $id | Out-Null
-New-NetFirewallRule -DisplayName 'allow-siem-fqdn-in' -Direction Inbound -Action Allow -Profile Any -Enabled True -RemoteDynamicKeywordAddresses $id | Out-Null
-$id`, name)
-	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command", script)
-	out, err := cmd.Output()
-	if err != nil {
-		stderr := ""
-		if exitErr, ok := err.(*exec.ExitError); ok {
-			stderr = string(exitErr.Stderr)
-		} else {
-			stderr = err.Error()
+func dnsServers() []string {
+	cmd := exec.Command("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		`Get-DnsClientServerAddress | ForEach-Object { $_.ServerAddresses }`)
+	out, _ := cmd.Output()
+	seen := map[string]struct{}{}
+	var ips []string
+	for _, line := range strings.Split(string(out), "\n") {
+		line = strings.TrimSpace(line)
+		if !isValidIP(line) {
+			continue
 		}
-		return string(out), stderr
+		if _, ok := seen[line]; ok {
+			continue
+		}
+		seen[line] = struct{}{}
+		ips = append(ips, line)
 	}
-	return strings.TrimSpace(string(out)), ""
+	return ips
 }
 
 func removeFQDNKeywords() {
@@ -101,6 +104,16 @@ func isolate(ipException []string) (string, string) {
 	outs = append(outs, stdout)
 	errs = append(errs, stderr)
 
+	stdout, stderr = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
+		"Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Block")
+	outs = append(outs, stdout)
+	errs = append(errs, stderr)
+
+	policy, _ := runCmd("netsh", "advfirewall", "show", "allprofiles")
+	if strings.Contains(policy, "AllowOutbound") || strings.Count(policy, "BlockOutbound") < 3 {
+		return strings.Join(outs, " "), "outbound policy is not block"
+	}
+
 	for _, ip := range staticIPs {
 		for _, dir := range []string{"in", "out"} {
 			name := "allow-siem-out"
@@ -108,7 +121,7 @@ func isolate(ipException []string) (string, string) {
 				name = "allow-siem-in"
 			}
 			for _, proto := range []string{"tcp", "udp"} {
-				stdout, stderr = addAllow(name, dir, proto, ip)
+				stdout, stderr = addAllow(name, dir, proto, ip, "")
 				outs = append(outs, stdout)
 				errs = append(errs, stderr)
 			}
@@ -122,33 +135,24 @@ func isolate(ipException []string) (string, string) {
 				name = "allow-fqdn-in"
 			}
 			for _, proto := range []string{"tcp", "udp"} {
-				stdout, stderr = addAllow(name, dir, proto, ip)
+				stdout, stderr = addAllow(name, dir, proto, ip, "")
 				outs = append(outs, stdout)
 				errs = append(errs, stderr)
 			}
 		}
 	}
 
-	stdout, stderr = addAllow("allow-dns-out", "out", "any", "dns")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = addAllow("allow-dhcp-out", "out", "udp", "dhcp")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	var keywordIDs []string
-	for _, name := range names {
-		stdout, stderr = addFQDNAllow(name)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-		if strings.HasPrefix(stdout, "{") && strings.HasSuffix(stdout, "}") {
-			keywordIDs = append(keywordIDs, stdout)
+	for _, ip := range dnsServers() {
+		for _, proto := range []string{"udp", "tcp"} {
+			stdout, stderr = addAllow("allow-dns-out", "out", proto, ip, "53")
+			outs = append(outs, stdout)
+			errs = append(errs, stderr)
 		}
 	}
-	if len(keywordIDs) > 0 {
-		os.WriteFile(fqdnFile, []byte(strings.Join(keywordIDs, "\n")), 0644)
-	}
+
+	stdout, stderr = addAllow("allow-dhcp-out", "out", "udp", "dhcp", "67")
+	outs = append(outs, stdout)
+	errs = append(errs, stderr)
 
 	if len(names) > 0 {
 		writeLines(fqdnNamesFile, names)
@@ -181,7 +185,7 @@ func applyFQDNRules(ips []string) {
 				name = "allow-fqdn-in"
 			}
 			for _, proto := range []string{"tcp", "udp"} {
-				addAllow(name, dir, proto, ip)
+				addAllow(name, dir, proto, ip, "")
 			}
 		}
 	}
