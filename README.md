@@ -50,9 +50,9 @@ Network containment via platform-native firewalls. Blocks all traffic except whi
 | `release` | —            | Restore original firewall state     |
 
 
-Each exception is an IP, a CIDR range, or an FQDN such as `manager.example.com`. The name is resolved when isolation starts. A one-minute task then re-resolves it and updates the allow rules on Windows, Linux, and macOS, so a changing manager address keeps working. DNS stays allowed while that task is installed. On Windows 11 and Windows Server 2022 or newer, a firewall dynamic keyword follows the name as well.
+Each exception is an IP, a CIDR range, or an FQDN such as `manager.example.com`. The name is resolved when isolation starts. A one-minute task stays installed on Windows, Linux, and macOS. Each run checks the name every 10 seconds for about 55 seconds and adds any new address before it removes the old one, so the manager connection is not dropped. A changed address is picked up about 10 seconds after the DNS cache expires. If one name fails to resolve, its previous addresses stay allowed. DNS to the host's configured resolvers on port 53 stays allowed on every OS, even when every exception is an IP. Loopback stays allowed on Linux and macOS.
 
-On Windows, isolate also allows outbound DNS (`remoteip=dns`) and DHCP (`remoteip=dhcp`) so a hostname can resolve and the VM keeps its address. Those rules do not open the rest of the network. `blockinbound,blockoutbound` still drops every other flow.
+On Windows, isolate allows outbound DNS only to the configured resolvers, TCP and UDP port 53, and DHCP on UDP port 67, so a hostname can resolve and the host keeps its address. Those rules do not open the rest of the network. `blockinbound,blockoutbound` still drops every other flow. ICMP to a whitelisted address is allowed.
 
 If the host is already isolated (`backup/fw_rules.xml` exists), `isolate` does nothing until `release` runs.
 
@@ -395,7 +395,7 @@ Debug log and state file locations:
 
 Contain a compromised host by blocking all network traffic except to whitelisted IPs (e.g. Wazuh manager). Restore with `release`.
 
-Pass an IP, a CIDR range, or the manager FQDN from the agent's `ossec.conf` `<address>`. A one-minute task follows that name on Windows, Linux, and macOS. Windows also allows DHCP. Re-run `release` before `isolate` if the host is already isolated. `release` removes the task.
+Pass an IP, a CIDR range, or the manager FQDN from the agent's `ossec.conf` `<address>`. The follow task checks that name every 10 seconds. DNS is limited to the configured resolvers on port 53 on Windows, Linux, and macOS. Windows also allows DHCP on UDP port 67. Linux and macOS allow loopback. Re-run `release` before `isolate` if the host is already isolated. `release` removes the task and keeps the firewall backup if the restore fails. On macOS, check the rules with `pfctl -nf /etc/pf.conf` before loading them on a host.
 
 **Isolate:**
 

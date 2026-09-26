@@ -6,6 +6,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/d4n5h/Wazuh-C-LR-Active-Response/internal/shared"
 )
@@ -104,11 +105,6 @@ func expandExceptions(items []string) (staticIPs []string, names []string, resol
 	return staticIPs, names, resolved, nil
 }
 
-func resolveNames(names []string) ([]string, error) {
-	_, _, resolved, err := expandExceptions(names)
-	return resolved, err
-}
-
 func readLines(path string) []string {
 	data, err := os.ReadFile(path)
 	if err != nil {
@@ -130,6 +126,66 @@ func writeLines(path string, lines []string) error {
 		body += "\n"
 	}
 	return os.WriteFile(path, []byte(body), 0644)
+}
+
+func unique(in []string) []string {
+	seen := map[string]struct{}{}
+	var out []string
+	for _, s := range in {
+		if s == "" {
+			continue
+		}
+		if _, ok := seen[s]; ok {
+			continue
+		}
+		seen[s] = struct{}{}
+		out = append(out, s)
+	}
+	return out
+}
+
+func resolveEach(names, prev []string, lookup func(string) ([]net.IP, error)) ([]string, bool) {
+	var out []string
+	complete := true
+	for _, n := range names {
+		ips, err := lookup(n)
+		if err != nil || len(ips) == 0 {
+			complete = false
+			continue
+		}
+		for _, ip := range ips {
+			if v4 := ip.To4(); v4 != nil {
+				ip = v4
+			}
+			out = append(out, ip.String())
+		}
+	}
+	if !complete {
+		out = append(out, prev...)
+	}
+	return unique(out), complete
+}
+
+func diff(old, next []string) (add, remove []string) {
+	have := map[string]struct{}{}
+	want := map[string]struct{}{}
+	for _, s := range old {
+		have[s] = struct{}{}
+	}
+	for _, s := range next {
+		want[s] = struct{}{}
+	}
+	for _, s := range next {
+		if _, ok := have[s]; !ok {
+			add = append(add, s)
+		}
+	}
+	for _, s := range old {
+		if _, ok := want[s]; !ok {
+			remove = append(remove, s)
+		}
+	}
+	return add, remove
 }
 
 func sameSet(a, b []string) bool {
@@ -158,10 +214,154 @@ func selfExe() string {
 }
 
 var (
-	fqdnNamesFile = filepath.Join(backupDir, "fqdn.txt")
-	fqdnIPsFile   = filepath.Join(backupDir, "fqdn-ips.txt")
-	staticIPsFile = filepath.Join(backupDir, "static-ips.txt")
+	fqdnNamesFile   = filepath.Join(backupDir, "fqdn.txt")
+	fqdnIPsFile     = filepath.Join(backupDir, "fqdn-ips.txt")
+	staticIPsFile   = filepath.Join(backupDir, "static-ips.txt")
+	refreshStopFile = filepath.Join(backupDir, "refresh.stop")
 )
+
+const (
+	refreshEvery = 10 * time.Second
+	refreshFor   = 55 * time.Second
+)
+
+type steps struct {
+	failed []string
+}
+
+func (s *steps) note(name, errOut string) {
+	msg := strings.Join(strings.Fields(errOut), " ")
+	if msg != "" {
+		s.failed = append(s.failed, name+": "+msg)
+	}
+}
+
+func lookupIPs(name string) []string {
+	ips, err := net.LookupIP(name)
+	if err != nil {
+		return nil
+	}
+	var out []string
+	for _, ip := range ips {
+		if v4 := ip.To4(); v4 != nil {
+			ip = v4
+		}
+		out = append(out, ip.String())
+	}
+	return unique(out)
+}
+
+func importOK(out, errOut string) bool {
+	return strings.TrimSpace(errOut) == "" && strings.Contains(out, "Ok.")
+}
+
+func summaryLine(static, names, dns []string, refresh string, errs []string) string {
+	stat, fqdn, dnsPart := "none", "none", "none"
+	if len(static) > 0 {
+		stat = strings.Join(static, ",")
+	}
+	if len(names) > 0 {
+		parts := make([]string, 0, len(names))
+		for _, n := range names {
+			ips := lookupIPs(n)
+			if len(ips) == 0 {
+				parts = append(parts, n+"=unresolved")
+				continue
+			}
+			parts = append(parts, n+"="+strings.Join(ips, ","))
+		}
+		fqdn = strings.Join(parts, " ")
+	}
+	if len(dns) > 0 {
+		dnsPart = strings.Join(dns, ",")
+	}
+	if refresh == "" {
+		refresh = "none"
+	}
+	line := fmt.Sprintf("isolated; static: %s; fqdn: %s; dns: %s; refresh: %s", stat, fqdn, dnsPart, refresh)
+	if len(errs) > 0 {
+		line += "; errors: " + strings.Join(errs, "; ")
+	}
+	return line
+}
+
+func lock(path string, stale time.Duration) (func(), bool) {
+	open := func() (*os.File, error) {
+		return os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0644)
+	}
+	f, err := open()
+	if err != nil {
+		info, statErr := os.Stat(path)
+		if statErr != nil || time.Since(info.ModTime()) < stale {
+			return nil, false
+		}
+		os.Remove(path)
+		f, err = open()
+		if err != nil {
+			return nil, false
+		}
+	}
+	fmt.Fprintf(f, "%d\n", os.Getpid())
+	return func() {
+		f.Close()
+		os.Remove(path)
+	}, true
+}
+
+func refreshLoop() {
+	if !canRefresh() {
+		return
+	}
+	os.MkdirAll(backupDir, 0755)
+	unlock, ok := lock(filepath.Join(backupDir, "refresh.lock"), 2*time.Minute)
+	if !ok {
+		return
+	}
+	defer unlock()
+	start := time.Now()
+	for {
+		if _, err := os.Stat(refreshStopFile); err == nil {
+			return
+		}
+		names := readLines(fqdnNamesFile)
+		if len(names) == 0 {
+			return
+		}
+		prev := readLines(fqdnIPsFile)
+		next, _ := resolveEach(names, prev, net.LookupIP)
+		if len(next) > 0 && !sameSet(next, prev) {
+			add, remove := diff(prev, next)
+			if applyFQDN(add, remove, next) == nil {
+				writeLines(fqdnIPsFile, next)
+			}
+		}
+		if time.Since(start)+refreshEvery >= refreshFor {
+			return
+		}
+		time.Sleep(refreshEvery)
+	}
+}
+
+func pauseRefresh() func() {
+	os.MkdirAll(backupDir, 0755)
+	os.WriteFile(refreshStopFile, []byte("1"), 0644)
+	deadline := time.Now().Add(12 * time.Second)
+	var unlock func()
+	for {
+		var ok bool
+		unlock, ok = lock(filepath.Join(backupDir, "refresh.lock"), 2*time.Minute)
+		if ok || time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(200 * time.Millisecond)
+	}
+	return func() {
+		if unlock != nil {
+			unlock()
+		}
+		os.Remove(refreshStopFile)
+	}
+}
 
 func main() {
 	defer func() {
@@ -171,7 +371,7 @@ func main() {
 	}()
 
 	if len(os.Args) > 1 && os.Args[1] == "refresh" {
-		refresh()
+		refreshLoop()
 		return
 	}
 

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -28,14 +29,9 @@ func runCmd(args ...string) (string, string) {
 	return string(out), stderr
 }
 
-func addAllow(name, dir, protocol, remoteip, remoteport string) (string, string) {
-	args := []string{"netsh", "advfirewall", "firewall", "add", "rule",
-		"name=" + name, "dir=" + dir, "action=allow", "protocol=" + protocol,
-		"remoteip=" + remoteip, "profile=any", "enable=yes"}
-	if remoteport != "" {
-		args = append(args, "remoteport="+remoteport)
-	}
-	return runCmd(args...)
+func canRefresh() bool {
+	_, err := os.Stat(fwRulesFile)
+	return err == nil
 }
 
 func dnsServers() []string {
@@ -70,6 +66,24 @@ func removeFQDNKeywords() {
 	os.Remove(fqdnFile)
 }
 
+func addAllow(s *steps, name, dir, protocol, remoteip, remoteport string) {
+	args := []string{"netsh", "advfirewall", "firewall", "add", "rule",
+		"name=" + name, "dir=" + dir, "action=allow", "protocol=" + protocol,
+		"remoteip=" + remoteip, "profile=any", "enable=yes"}
+	if remoteport != "" {
+		args = append(args, "remoteport="+remoteport)
+	}
+	_, errOut := runCmd(args...)
+	s.note(name, errOut)
+}
+
+func addGroup(s *steps, name, dir string, ips []string) {
+	if len(ips) == 0 {
+		return
+	}
+	addAllow(s, name, dir, "any", strings.Join(ips, ","), "")
+}
+
 func isolate(ipException []string) (string, string) {
 	staticIPs, names, resolved, err := expandExceptions(ipException)
 	if err != nil {
@@ -77,93 +91,53 @@ func isolate(ipException []string) (string, string) {
 	}
 
 	os.MkdirAll(backupDir, 0755)
-
 	if _, err := os.Stat(fwRulesFile); err == nil {
 		return "", "The device is already isolated, no action was taken."
 	}
 
-	var outs, errs []string
-
-	stdout, stderr := runCmd("netsh", "advfirewall", "export", fwRulesFile)
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("netsh", "advfirewall", "firewall", "delete", "rule", "name=all")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("netsh", "advfirewall", "firewall", "set", "rule", "name=all", "new", "enable=no")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("netsh", "advfirewall", "set", "allprofiles", "state", "on")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("netsh", "advfirewall", "set", "allprofiles", "firewallpolicy", "blockinbound,blockoutbound")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
+	var s steps
+	_, errOut := runCmd("netsh", "advfirewall", "export", fwRulesFile)
+	s.note("export", errOut)
+	_, errOut = runCmd("netsh", "advfirewall", "firewall", "delete", "rule", "name=all")
+	s.note("delete-rules", errOut)
+	_, errOut = runCmd("netsh", "advfirewall", "firewall", "set", "rule", "name=all", "new", "enable=no")
+	s.note("disable-rules", errOut)
+	_, errOut = runCmd("netsh", "advfirewall", "set", "allprofiles", "state", "on")
+	s.note("firewall-on", errOut)
+	_, errOut = runCmd("netsh", "advfirewall", "set", "allprofiles", "firewallpolicy", "blockinbound,blockoutbound")
+	s.note("policy", errOut)
+	_, errOut = runCmd("powershell", "-NoProfile", "-NonInteractive", "-Command",
 		"Set-NetFirewallProfile -Profile Domain,Public,Private -Enabled True -DefaultInboundAction Block -DefaultOutboundAction Block")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
+	s.note("profile", errOut)
 
 	policy, _ := runCmd("netsh", "advfirewall", "show", "allprofiles")
 	if strings.Contains(policy, "AllowOutbound") || strings.Count(policy, "BlockOutbound") < 3 {
-		return strings.Join(outs, " "), "outbound policy is not block"
+		return "", "outbound policy is not block"
 	}
 
-	for _, ip := range staticIPs {
-		for _, dir := range []string{"in", "out"} {
-			name := "allow-siem-out"
-			if dir == "in" {
-				name = "allow-siem-in"
-			}
-			for _, proto := range []string{"tcp", "udp"} {
-				stdout, stderr = addAllow(name, dir, proto, ip, "")
-				outs = append(outs, stdout)
-				errs = append(errs, stderr)
-			}
-		}
+	addGroup(&s, "allow-siem-in", "in", staticIPs)
+	addGroup(&s, "allow-siem-out", "out", staticIPs)
+	addGroup(&s, "allow-fqdn-in", "in", resolved)
+	addGroup(&s, "allow-fqdn-out", "out", resolved)
+
+	dns := dnsServers()
+	if len(dns) > 0 {
+		list := strings.Join(dns, ",")
+		addAllow(&s, "allow-dns-out", "out", "udp", list, "53")
+		addAllow(&s, "allow-dns-out", "out", "tcp", list, "53")
 	}
+	addAllow(&s, "allow-dhcp-out", "out", "udp", "dhcp", "67")
 
-	for _, ip := range resolved {
-		for _, dir := range []string{"in", "out"} {
-			name := "allow-fqdn-out"
-			if dir == "in" {
-				name = "allow-fqdn-in"
-			}
-			for _, proto := range []string{"tcp", "udp"} {
-				stdout, stderr = addAllow(name, dir, proto, ip, "")
-				outs = append(outs, stdout)
-				errs = append(errs, stderr)
-			}
-		}
-	}
-
-	for _, ip := range dnsServers() {
-		for _, proto := range []string{"udp", "tcp"} {
-			stdout, stderr = addAllow("allow-dns-out", "out", proto, ip, "53")
-			outs = append(outs, stdout)
-			errs = append(errs, stderr)
-		}
-	}
-
-	stdout, stderr = addAllow("allow-dhcp-out", "out", "udp", "dhcp", "67")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
+	refresh := ""
 	if len(names) > 0 {
 		writeLines(fqdnNamesFile, names)
 		writeLines(fqdnIPsFile, resolved)
 		writeLines(staticIPsFile, staticIPs)
-		stdout, stderr = installRefreshTask()
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		_, errOut = installRefreshTask()
+		s.note("refresh-task", errOut)
+		refresh = "C-LR-FQDN"
 	}
-
-	return strings.Join(outs, " "), strings.Join(errs, " ")
+	return summaryLine(staticIPs, names, dns, refresh, s.failed), ""
 }
 
 func installRefreshTask() (string, string) {
@@ -175,45 +149,35 @@ func removeRefreshTask() {
 	runCmd("schtasks", "/delete", "/tn", "C-LR-FQDN", "/f")
 }
 
-func applyFQDNRules(ips []string) {
-	runCmd("netsh", "advfirewall", "firewall", "delete", "rule", "name=allow-fqdn-in")
-	runCmd("netsh", "advfirewall", "firewall", "delete", "rule", "name=allow-fqdn-out")
-	for _, ip := range ips {
-		for _, dir := range []string{"in", "out"} {
-			name := "allow-fqdn-out"
-			if dir == "in" {
-				name = "allow-fqdn-in"
-			}
-			for _, proto := range []string{"tcp", "udp"} {
-				addAllow(name, dir, proto, ip, "")
-			}
+func applyFQDN(_, _, all []string) error {
+	if len(all) == 0 {
+		return errors.New("no addresses")
+	}
+	list := strings.Join(all, ",")
+	for _, name := range []string{"allow-fqdn-in", "allow-fqdn-out"} {
+		_, errOut := runCmd("netsh", "advfirewall", "firewall", "set", "rule",
+			"name="+name, "new", "remoteip="+list)
+		if strings.TrimSpace(errOut) != "" {
+			return errors.New(strings.TrimSpace(errOut))
 		}
 	}
-}
-
-func refresh() {
-	names := readLines(fqdnNamesFile)
-	if len(names) == 0 {
-		return
-	}
-	resolved, err := resolveNames(names)
-	if err != nil || len(resolved) == 0 || sameSet(resolved, readLines(fqdnIPsFile)) {
-		return
-	}
-	applyFQDNRules(resolved)
-	writeLines(fqdnIPsFile, resolved)
+	return nil
 }
 
 func release() (string, string) {
-	if _, err := os.Stat(fwRulesFile); err == nil {
-		stdout, stderr := runCmd("netsh", "advfirewall", "import", fwRulesFile)
-		removeRefreshTask()
-		removeFQDNKeywords()
-		os.Remove(fwRulesFile)
-		os.Remove(fqdnNamesFile)
-		os.Remove(fqdnIPsFile)
-		os.Remove(staticIPsFile)
-		return stdout, stderr
+	if _, err := os.Stat(fwRulesFile); err != nil {
+		return "", "The host is not isolated, or the backup has been removed."
 	}
-	return "", "The host is not isolated, or the backup has been removed."
+	resume := pauseRefresh()
+	defer resume()
+	out, errOut := runCmd("netsh", "advfirewall", "import", fwRulesFile)
+	if !importOK(out, errOut) {
+		return "", "restore failed; backup kept at " + fwRulesFile
+	}
+	removeRefreshTask()
+	removeFQDNKeywords()
+	for _, f := range []string{fwRulesFile, fqdnNamesFile, fqdnIPsFile, staticIPsFile} {
+		os.Remove(f)
+	}
+	return "released", ""
 }

@@ -3,6 +3,7 @@
 package main
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"os/exec"
@@ -12,28 +13,27 @@ import (
 
 var (
 	fwBackupFile   = filepath.Join(backupDir, "fw_rules.backup")
+	iptBackupFile  = filepath.Join(backupDir, "fw_rules.ipt")
+	ip6BackupFile  = filepath.Join(backupDir, "fw_rules.ip6")
 	backendFile    = filepath.Join(backupDir, "backend.type")
 	isolatedMarker = filepath.Join(backupDir, ".isolated")
 )
-
-func joinParts(parts []string) string {
-	var kept []string
-	for _, p := range parts {
-		p = strings.TrimSpace(p)
-		if p != "" {
-			kept = append(kept, p)
-		}
-	}
-	return strings.Join(kept, " ")
-}
 
 func runCmd(name string, args ...string) (string, string) {
 	cmd := exec.Command(name, args...)
 	out, err := cmd.CombinedOutput()
 	if err != nil {
-		return string(out), err.Error()
+		msg := strings.TrimSpace(string(out))
+		if msg == "" {
+			msg = err.Error()
+		}
+		return string(out), msg
 	}
 	return string(out), ""
+}
+
+func canRefresh() bool {
+	return isIsolated()
 }
 
 func detectBackend() string {
@@ -48,216 +48,170 @@ func isIsolated() bool {
 	return err == nil
 }
 
+func dnsServers() []string {
+	for _, path := range []string{"/run/systemd/resolve/resolv.conf", "/etc/resolv.conf"} {
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if ips := parseResolvConf(string(data)); len(ips) > 0 {
+			return ips
+		}
+	}
+	return nil
+}
+
+func ipBin(ip string) string {
+	if isIPv6(ip) {
+		return "ip6tables"
+	}
+	return "iptables"
+}
+
+func nftFam(ip string) string {
+	if isIPv6(ip) {
+		return "ip6"
+	}
+	return "ip"
+}
+
+func setFor(ip string) string {
+	if isIPv6(ip) {
+		return "fqdn6"
+	}
+	return "fqdn4"
+}
+
 func isolate(ipException []string) (string, string) {
 	staticIPs, names, resolved, err := expandExceptions(ipException)
 	if err != nil {
 		return "", err.Error()
 	}
-
 	os.MkdirAll(backupDir, 0755)
-
 	if isIsolated() {
 		return "", "The device is already isolated, no action was taken."
 	}
 
 	backend := detectBackend()
-	var outs, errs []string
-
+	dns := dnsServers()
+	var s steps
 	switch backend {
 	case "nftables":
-		stdout, stderr := isolateNftables(staticIPs, resolved, len(names) > 0)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		isolateNftables(&s, staticIPs, resolved, dns)
 	default:
-		stdout, stderr := isolateIptables(staticIPs, resolved, len(names) > 0)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		isolateIptables(&s, staticIPs, resolved, dns)
 	}
-
-	for _, e := range errs {
-		if strings.TrimSpace(e) != "" {
-			return joinParts(outs), joinParts(errs)
-		}
+	if len(s.failed) > 0 {
+		return "", summaryLine(staticIPs, names, dns, "", s.failed)
 	}
 	os.WriteFile(backendFile, []byte(backend), 0644)
 	os.WriteFile(isolatedMarker, []byte("1"), 0644)
 
+	refresh := ""
 	if len(names) > 0 {
 		writeLines(fqdnNamesFile, names)
 		writeLines(fqdnIPsFile, resolved)
 		writeLines(staticIPsFile, staticIPs)
-		stdout, stderr := installRefreshTask()
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		_, errOut := installRefreshTask()
+		s.note("refresh-task", errOut)
+		refresh = "clr-fqdn"
 	}
-
-	return joinParts(outs), joinParts(errs)
+	if len(s.failed) > 0 {
+		return "", summaryLine(staticIPs, names, dns, refresh, s.failed)
+	}
+	return summaryLine(staticIPs, names, dns, refresh, nil), ""
 }
 
-func addNftIP(chain, fam, field, ip string) (string, string) {
-	return runCmd("nft", "add", "rule", "inet", "clr_isolate", chain, fam, field, ip, "accept")
+func sh(s *steps, name, script string) {
+	_, errOut := runCmd("sh", "-c", script)
+	s.note(name, errOut)
 }
 
-func isolateNftables(staticIPs, resolved []string, allowDNS bool) (string, string) {
-	var outs, errs []string
-
-	stdout, stderr := runCmd("sh", "-c", fmt.Sprintf("nft list ruleset > %s", fwBackupFile))
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("nft", "flush", "ruleset")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("nft", "add", "table", "inet", "clr_isolate")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("sh", "-c", `nft add chain inet clr_isolate input '{ type filter hook input priority 0; policy drop; }'`)
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("sh", "-c", `nft add chain inet clr_isolate output '{ type filter hook output priority 0; policy drop; }'`)
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	if allowDNS {
-		for _, rule := range []string{
-			"nft add rule inet clr_isolate output udp dport 53 accept",
-			"nft add rule inet clr_isolate output tcp dport 53 accept",
-			"nft add rule inet clr_isolate input udp sport 53 accept",
-			"nft add rule inet clr_isolate input tcp sport 53 accept",
-			"nft add chain inet clr_isolate fqdn_in",
-			"nft add chain inet clr_isolate fqdn_out",
-			"nft add rule inet clr_isolate input jump fqdn_in",
-			"nft add rule inet clr_isolate output jump fqdn_out",
-		} {
-			stdout, stderr = runCmd("sh", "-c", rule)
-			outs = append(outs, stdout)
-			errs = append(errs, stderr)
-		}
-	}
+func isolateNftables(s *steps, staticIPs, resolved, dns []string) {
+	sh(s, "backup", fmt.Sprintf("nft list ruleset > %s", fwBackupFile))
+	runCmd("sh", "-c", fmt.Sprintf("iptables-save > %s", iptBackupFile))
+	runCmd("sh", "-c", fmt.Sprintf("ip6tables-save > %s", ip6BackupFile))
+	sh(s, "flush", "nft flush ruleset")
+	sh(s, "table", "nft add table inet clr_isolate")
+	sh(s, "input", `nft add chain inet clr_isolate input '{ type filter hook input priority 0; policy drop; }'`)
+	sh(s, "output", `nft add chain inet clr_isolate output '{ type filter hook output priority 0; policy drop; }'`)
+	sh(s, "forward", `nft add chain inet clr_isolate forward '{ type filter hook forward priority 0; policy drop; }'`)
+	sh(s, "loopback-in", "nft add rule inet clr_isolate input iif lo accept")
+	sh(s, "loopback-out", "nft add rule inet clr_isolate output oif lo accept")
+	addNftDNS(s, dns)
+	sh(s, "set4", `nft add set inet clr_isolate fqdn4 '{ type ipv4_addr; }'`)
+	sh(s, "set6", `nft add set inet clr_isolate fqdn6 '{ type ipv6_addr; }'`)
+	sh(s, "set4-in", "nft add rule inet clr_isolate input ip saddr @fqdn4 accept")
+	sh(s, "set4-out", "nft add rule inet clr_isolate output ip daddr @fqdn4 accept")
+	sh(s, "set6-in", "nft add rule inet clr_isolate input ip6 saddr @fqdn6 accept")
+	sh(s, "set6-out", "nft add rule inet clr_isolate output ip6 daddr @fqdn6 accept")
 
 	for _, ip := range staticIPs {
-		fam := "ip"
-		if isIPv6(ip) {
-			fam = "ip6"
-		}
-		stdout, stderr = addNftIP("input", fam, "saddr", ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-		stdout, stderr = addNftIP("output", fam, "daddr", ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		fam := nftFam(ip)
+		sh(s, "static-in", fmt.Sprintf("nft add rule inet clr_isolate input %s saddr %s accept", fam, ip))
+		sh(s, "static-out", fmt.Sprintf("nft add rule inet clr_isolate output %s daddr %s accept", fam, ip))
 	}
-
 	for _, ip := range resolved {
-		fam := "ip"
-		if isIPv6(ip) {
-			fam = "ip6"
-		}
-		stdout, stderr = addNftIP("fqdn_in", fam, "saddr", ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-		stdout, stderr = addNftIP("fqdn_out", fam, "daddr", ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		_, errOut := runCmd("sh", "-c", fmt.Sprintf("nft add element inet clr_isolate %s { %s }", setFor(ip), ip))
+		s.note("fqdn", errOut)
 	}
-
-	return joinParts(outs), joinParts(errs)
 }
 
-func addIptablesIP(bin, chain, flag, ip string) (string, string) {
-	return runCmd(bin, "-A", chain, flag, ip, "-j", "ACCEPT")
+func addNftDNS(s *steps, dns []string) {
+	for _, r := range dns {
+		fam := nftFam(r)
+		sh(s, "dns-out", fmt.Sprintf("nft add rule inet clr_isolate output %s daddr %s udp dport 53 accept", fam, r))
+		sh(s, "dns-out", fmt.Sprintf("nft add rule inet clr_isolate output %s daddr %s tcp dport 53 accept", fam, r))
+		sh(s, "dns-in", fmt.Sprintf("nft add rule inet clr_isolate input %s saddr %s udp sport 53 accept", fam, r))
+		sh(s, "dns-in", fmt.Sprintf("nft add rule inet clr_isolate input %s saddr %s tcp sport 53 accept", fam, r))
+	}
 }
 
-func isolateIptables(staticIPs, resolved []string, allowDNS bool) (string, string) {
-	var outs, errs []string
-
-	stdout, stderr := runCmd("sh", "-c", fmt.Sprintf("iptables-save > %s", fwBackupFile))
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("iptables", "-F")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("iptables", "-P", "INPUT", "DROP")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("iptables", "-P", "OUTPUT", "DROP")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	stdout, stderr = runCmd("iptables", "-P", "FORWARD", "DROP")
-	outs = append(outs, stdout)
-	errs = append(errs, stderr)
-
-	if allowDNS {
-		for _, spec := range [][]string{
-			{"OUTPUT", "-p", "udp", "--dport", "53"},
-			{"OUTPUT", "-p", "tcp", "--dport", "53"},
-			{"INPUT", "-p", "udp", "--sport", "53"},
-			{"INPUT", "-p", "tcp", "--sport", "53"},
-		} {
-			args := append([]string{"iptables", "-A"}, spec...)
-			args = append(args, "-j", "ACCEPT")
-			stdout, stderr = runCmd(args[0], args[1:]...)
-			outs = append(outs, stdout)
-			errs = append(errs, stderr)
-		}
-		stdout, stderr = runCmd("iptables", "-N", "CLR_FQDN_IN")
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-		stdout, stderr = runCmd("iptables", "-N", "CLR_FQDN_OUT")
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-		stdout, stderr = runCmd("iptables", "-A", "INPUT", "-j", "CLR_FQDN_IN")
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-		stdout, stderr = runCmd("iptables", "-A", "OUTPUT", "-j", "CLR_FQDN_OUT")
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+func isolateIptables(s *steps, staticIPs, resolved, dns []string) {
+	sh(s, "backup", fmt.Sprintf("iptables-save > %s", fwBackupFile))
+	sh(s, "flush", "iptables -F")
+	sh(s, "policy-in", "iptables -P INPUT DROP")
+	sh(s, "policy-out", "iptables -P OUTPUT DROP")
+	sh(s, "policy-fwd", "iptables -P FORWARD DROP")
+	sh(s, "loopback-in", "iptables -A INPUT -i lo -j ACCEPT")
+	sh(s, "loopback-out", "iptables -A OUTPUT -o lo -j ACCEPT")
+	addIptDNS(s, dns)
+	if len(resolved) > 0 {
+		sh(s, "fqdn-chain-in", "iptables -N CLR_FQDN_IN")
+		sh(s, "fqdn-chain-out", "iptables -N CLR_FQDN_OUT")
+		sh(s, "fqdn-jump-in", "iptables -A INPUT -j CLR_FQDN_IN")
+		sh(s, "fqdn-jump-out", "iptables -A OUTPUT -j CLR_FQDN_OUT")
 		for _, ip := range resolved {
-			if isIPv6(ip) {
-				runCmd("ip6tables", "-N", "CLR_FQDN_IN")
-				runCmd("ip6tables", "-N", "CLR_FQDN_OUT")
-				runCmd("ip6tables", "-A", "INPUT", "-j", "CLR_FQDN_IN")
-				runCmd("ip6tables", "-A", "OUTPUT", "-j", "CLR_FQDN_OUT")
-				break
+			if !isIPv6(ip) {
+				continue
 			}
+			sh(s, "fqdn6-chain-in", "ip6tables -N CLR_FQDN_IN")
+			sh(s, "fqdn6-chain-out", "ip6tables -N CLR_FQDN_OUT")
+			sh(s, "fqdn6-jump-in", "ip6tables -A INPUT -j CLR_FQDN_IN")
+			sh(s, "fqdn6-jump-out", "ip6tables -A OUTPUT -j CLR_FQDN_OUT")
+			break
 		}
 	}
-
 	for _, ip := range staticIPs {
-		bin := "iptables"
-		if isIPv6(ip) {
-			bin = "ip6tables"
-		}
-		stdout, stderr = addIptablesIP(bin, "INPUT", "-s", ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-		stdout, stderr = addIptablesIP(bin, "OUTPUT", "-d", ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		bin := ipBin(ip)
+		sh(s, "static-in", fmt.Sprintf("%s -A INPUT -s %s -j ACCEPT", bin, ip))
+		sh(s, "static-out", fmt.Sprintf("%s -A OUTPUT -d %s -j ACCEPT", bin, ip))
 	}
-
 	for _, ip := range resolved {
-		bin := "iptables"
-		inChain, outChain := "CLR_FQDN_IN", "CLR_FQDN_OUT"
-		if isIPv6(ip) {
-			bin = "ip6tables"
-		}
-		stdout, stderr = addIptablesIP(bin, inChain, "-s", ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-		stdout, stderr = addIptablesIP(bin, outChain, "-d", ip)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		bin := ipBin(ip)
+		sh(s, "fqdn-in", fmt.Sprintf("%s -A CLR_FQDN_IN -s %s -j ACCEPT", bin, ip))
+		sh(s, "fqdn-out", fmt.Sprintf("%s -A CLR_FQDN_OUT -d %s -j ACCEPT", bin, ip))
 	}
+}
 
-	return joinParts(outs), joinParts(errs)
+func addIptDNS(s *steps, dns []string) {
+	for _, r := range dns {
+		bin := ipBin(r)
+		sh(s, "dns-out", fmt.Sprintf("%s -A OUTPUT -d %s -p udp --dport 53 -j ACCEPT", bin, r))
+		sh(s, "dns-out", fmt.Sprintf("%s -A OUTPUT -d %s -p tcp --dport 53 -j ACCEPT", bin, r))
+		sh(s, "dns-in", fmt.Sprintf("%s -A INPUT -s %s -p udp --sport 53 -j ACCEPT", bin, r))
+		sh(s, "dns-in", fmt.Sprintf("%s -A INPUT -s %s -p tcp --sport 53 -j ACCEPT", bin, r))
+	}
 }
 
 func installRefreshTask() (string, string) {
@@ -272,78 +226,146 @@ func removeRefreshTask() {
 	os.Remove("/etc/cron.d/clr-fqdn")
 }
 
-func refresh() {
+func applyFQDN(add, remove, all []string) error {
 	if !isIsolated() {
-		return
-	}
-	names := readLines(fqdnNamesFile)
-	if len(names) == 0 {
-		return
-	}
-	resolved, err := resolveNames(names)
-	if err != nil || len(resolved) == 0 || sameSet(resolved, readLines(fqdnIPsFile)) {
-		return
+		return errors.New("not isolated")
 	}
 	backend, _ := os.ReadFile(backendFile)
 	if strings.TrimSpace(string(backend)) == "nftables" {
-		runCmd("nft", "flush", "chain", "inet", "clr_isolate", "fqdn_in")
-		runCmd("nft", "flush", "chain", "inet", "clr_isolate", "fqdn_out")
-		for _, ip := range resolved {
-			fam := "ip"
-			if isIPv6(ip) {
-				fam = "ip6"
-			}
-			addNftIP("fqdn_in", fam, "saddr", ip)
-			addNftIP("fqdn_out", fam, "daddr", ip)
-		}
-	} else {
-		runCmd("iptables", "-F", "CLR_FQDN_IN")
-		runCmd("iptables", "-F", "CLR_FQDN_OUT")
-		runCmd("ip6tables", "-F", "CLR_FQDN_IN")
-		runCmd("ip6tables", "-F", "CLR_FQDN_OUT")
-		for _, ip := range resolved {
-			bin := "iptables"
-			if isIPv6(ip) {
-				bin = "ip6tables"
-			}
-			addIptablesIP(bin, "CLR_FQDN_IN", "-s", ip)
-			addIptablesIP(bin, "CLR_FQDN_OUT", "-d", ip)
+		return applyNft(add, remove, all)
+	}
+	return applyIpt(add, remove)
+}
+
+func nftHasSets() bool {
+	out, errOut := runCmd("nft", "list", "set", "inet", "clr_isolate", "fqdn4")
+	return errOut == "" && strings.Contains(out, "fqdn4")
+}
+
+func applyNft(add, remove, all []string) error {
+	if !nftHasSets() {
+		return migrateNft(all)
+	}
+	for _, ip := range add {
+		if _, errOut := runCmd("sh", "-c", fmt.Sprintf("nft add element inet clr_isolate %s { %s }", setFor(ip), ip)); errOut != "" {
+			return errors.New(errOut)
 		}
 	}
-	writeLines(fqdnIPsFile, resolved)
+	for _, ip := range remove {
+		runCmd("sh", "-c", fmt.Sprintf("nft delete element inet clr_isolate %s { %s }", setFor(ip), ip))
+	}
+	return nil
+}
+
+func migrateNft(all []string) error {
+	for _, script := range []string{
+		`nft add set inet clr_isolate fqdn4 '{ type ipv4_addr; }'`,
+		`nft add set inet clr_isolate fqdn6 '{ type ipv6_addr; }'`,
+		"nft add rule inet clr_isolate input ip saddr @fqdn4 accept",
+		"nft add rule inet clr_isolate output ip daddr @fqdn4 accept",
+		"nft add rule inet clr_isolate input ip6 saddr @fqdn6 accept",
+		"nft add rule inet clr_isolate output ip6 daddr @fqdn6 accept",
+	} {
+		if _, errOut := runCmd("sh", "-c", script); errOut != "" {
+			return errors.New(errOut)
+		}
+	}
+	for _, ip := range all {
+		if _, errOut := runCmd("sh", "-c", fmt.Sprintf("nft add element inet clr_isolate %s { %s }", setFor(ip), ip)); errOut != "" {
+			return errors.New(errOut)
+		}
+	}
+	runCmd("nft", "flush", "chain", "inet", "clr_isolate", "fqdn_in")
+	runCmd("nft", "flush", "chain", "inet", "clr_isolate", "fqdn_out")
+	return nil
+}
+
+func applyIpt(add, remove []string) error {
+	for _, ip := range add {
+		bin := ipBin(ip)
+		if _, errOut := runCmd(bin, "-A", "CLR_FQDN_IN", "-s", ip, "-j", "ACCEPT"); errOut != "" {
+			return errors.New(errOut)
+		}
+		if _, errOut := runCmd(bin, "-A", "CLR_FQDN_OUT", "-d", ip, "-j", "ACCEPT"); errOut != "" {
+			return errors.New(errOut)
+		}
+	}
+	for _, ip := range remove {
+		bin := ipBin(ip)
+		runCmd(bin, "-D", "CLR_FQDN_IN", "-s", ip, "-j", "ACCEPT")
+		runCmd(bin, "-D", "CLR_FQDN_OUT", "-d", ip, "-j", "ACCEPT")
+	}
+	return nil
+}
+
+func restoreSaved(bin, path string) string {
+	info, err := os.Stat(path)
+	if err != nil || info.Size() == 0 {
+		return ""
+	}
+	_, errOut := runCmd("sh", "-c", fmt.Sprintf("%s-restore < %s", bin, path))
+	return errOut
 }
 
 func release() (string, string) {
 	if !isIsolated() {
 		return "", "The host is not isolated, or the backup has been removed."
 	}
+	resume := pauseRefresh()
+	defer resume()
 
 	backend, _ := os.ReadFile(backendFile)
-	var outs, errs []string
-	var stdout, stderr string
-
+	var errOut string
 	switch strings.TrimSpace(string(backend)) {
 	case "nftables":
-		stdout, stderr = runCmd("nft", "flush", "ruleset")
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
-
-		stdout, stderr = runCmd("nft", "-f", fwBackupFile)
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		_, errOut = runCmd("nft", "flush", "ruleset")
+		if errOut == "" {
+			_, errOut = runCmd("nft", "-f", fwBackupFile)
+		}
+		if errOut != "" {
+			iptInfo, iptErr := os.Stat(iptBackupFile)
+			ip6Info, ip6Err := os.Stat(ip6BackupFile)
+			hasIpt := iptErr == nil && iptInfo.Size() > 0
+			hasIP6 := ip6Err == nil && ip6Info.Size() > 0
+			if hasIpt || hasIP6 {
+				errOut = ""
+				if hasIpt {
+					errOut = restoreSaved("iptables", iptBackupFile)
+				}
+				if errOut == "" && hasIP6 {
+					errOut = restoreSaved("ip6tables", ip6BackupFile)
+				}
+			}
+		}
 	default:
-		stdout, stderr = runCmd("sh", "-c", fmt.Sprintf("iptables-restore < %s", fwBackupFile))
-		outs = append(outs, stdout)
-		errs = append(errs, stderr)
+		saved, _ := os.ReadFile(fwBackupFile)
+		_, errOut = runCmd("sh", "-c", fmt.Sprintf("iptables-restore < %s", fwBackupFile))
+		if errOut == "" && !strings.Contains(string(saved), "*filter") {
+			for _, script := range []string{
+				"iptables -F",
+				"iptables -X",
+				"iptables -P INPUT ACCEPT",
+				"iptables -P OUTPUT ACCEPT",
+				"iptables -P FORWARD ACCEPT",
+			} {
+				if _, e := runCmd("sh", "-c", script); e != "" {
+					errOut = e
+					break
+				}
+			}
+		}
 	}
-
+	if errOut != "" {
+		return "", "restore failed; backup kept at " + fwBackupFile
+	}
 	os.Remove(fwBackupFile)
+	os.Remove(iptBackupFile)
+	os.Remove(ip6BackupFile)
 	os.Remove(backendFile)
 	os.Remove(isolatedMarker)
 	os.Remove(fqdnNamesFile)
 	os.Remove(fqdnIPsFile)
 	os.Remove(staticIPsFile)
 	removeRefreshTask()
-
-	return joinParts(outs), joinParts(errs)
+	return "released", ""
 }
